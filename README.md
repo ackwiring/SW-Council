@@ -49,12 +49,12 @@ Platform-specific executable wrappers are provided to run the Python script seam
 ## 🚦 Verbose Notifications & Step Progress
 
 The tool prints step-by-step progress to `stdout` with descriptive summaries of each milestone:
-- 🌀 **Step 1 Started**: Initializing parallel advisor personas.
-- ✅ **Step 1 Completed**: Summarizes the number of collected code audits.
-- 🌀 **Step 2 Started**: Distributing anonymized peer ranking prompts.
-- ✅ **Step 2 Completed**: Displays computed consensus rankings.
-- 🌀 **Step 3 Started**: Invoking the Chairman model for synthesis.
-- ✅ **Step 3 Completed**: Confirms successful generation of the final report.
+- 🌀 **Step 1 Started**: `🌀 Step 1: Stage 1 (Advisor Responses Collection) has started...`
+- ✅ **Step 1 Completed**: `✅ Step 1 has been completed - successfully collected code audit feedback from [count] separate model personas.`
+- 🌀 **Step 2 Started**: `🌀 Step 2: Stage 2 (Peer Review and Ranking) has started...`
+- ✅ **Step 2 Completed**: `✅ Step 2 has been completed - peer rankings collected and consensus computed: [rankings].`
+- 🌀 **Step 3 Started**: `🌀 Step 3: Stage 3 (Chairman Synthesis) has started...`
+- ✅ **Step 3 Completed**: `✅ Step 3 has been completed - chairman has synthesized the final consensus report and generated the action plan.`
 
 ---
 
@@ -62,4 +62,5 @@ The tool prints step-by-step progress to `stdout` with descriptive summaries of 
 
 1. **OpenRouter (Primary)**: Uses `OPENROUTER_API_KEY` to run the parallel queries across configured models (e.g. `google/gemini-2.5-flash`, `meta-llama/llama-3.3-70b-instruct`, `deepseek/deepseek-chat`, `qwen/qwen-2.5-72b-instruct`).
 2. **Gemini API (Secondary Fallback)**: Automatically falls back to native Gemini APIs if `GEMINI_API_KEY` is present.
-3. **Ollama (Local Fallback)**: If no keys are set, queries local Ollama instances on port `11434` (using `qwen2.5:14b-instruct`).
+3. **Ollama (Local routing & fallback)**: If the requested model is installed locally in Ollama (checked via `/api/tags`), the engine bypasses OpenRouter and queries it directly. If no keys are set, the engine falls back to querying the requested model on local Ollama.
+   * **Context Size Handling**: During Stage 2 (Peer Review), the cascading context size is quite large. To prevent `exceed_context_size_error` (HTTP 400 Bad Request) from Ollama, the engine dynamically sets the context window option (`num_ctx`) to **32,768** tokens for all local Ollama requests. Ensure your local machine has sufficient RAM/VRAM allocation to support 32k contexts for the running models.

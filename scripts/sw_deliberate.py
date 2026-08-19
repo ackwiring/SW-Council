@@ -70,6 +70,41 @@ def get_git_diff():
     except Exception:
         return ""
 
+def is_model_in_ollama(model: str) -> bool:
+    try:
+        req = urllib.request.Request("http://localhost:11434/api/tags")
+        with urllib.request.urlopen(req, timeout=5.0) as response:
+            data = json.loads(response.read().decode("utf-8"))
+            local_models = []
+            for m in data.get("models", []):
+                name = m.get("name", "")
+                local_models.append(name)
+                if name.endswith(":latest"):
+                    local_models.append(name[:-7])
+            return model in local_models
+    except Exception:
+        return False
+
+def query_ollama_sync(model: str, messages: list) -> str:
+    url = "http://localhost:11434/api/chat"
+    payload = {
+        "model": model,
+        "messages": messages,
+        "options": {
+            "num_ctx": 32768
+        },
+        "stream": False
+    }
+    headers = {"Content-Type": "application/json"}
+    req = urllib.request.Request(url, data=json.dumps(payload).encode("utf-8"), headers=headers, method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=360.0) as response:
+            res_data = json.loads(response.read().decode("utf-8"))
+            return res_data.get("message", {}).get("content", "")
+    except Exception as e:
+        print(f"⚠️ Error querying local Ollama model {model}: {e}")
+        return ""
+
 def query_openrouter_sync(model: str, messages: list) -> str:
     if not OPENROUTER_API_KEY:
         raise ValueError("OPENROUTER_API_KEY is not set.")
@@ -95,6 +130,22 @@ def query_openrouter_sync(model: str, messages: list) -> str:
             target_model = "deepseek-r1:8b"
         else:
             target_model = "qwen2.5:14b-instruct"
+    else:
+        # Map local model names to real OpenRouter model IDs when querying real OpenRouter API
+        model_mapping = {
+            "qwen2.5-coder:latest": "qwen/qwen-2.5-coder-14b-instruct",
+            "qwen-2.5-coder-32b-instruct": "qwen/qwen-2.5-coder-14b-instruct",
+            "glm4:latest": "zhipuai/glm-4-9b-chat",
+            "gemma3:12b": "google/gemma-3-12b-it",
+            "deepseek-r1:8b": "deepseek/deepseek-r1-distill-llama-8b",
+            "deepseek-coder:6.7b": "deepseek/deepseek-coder-6.7b-instruct",
+            "nemotron-mini:latest": "nvidia/nemotron-mini-4b-instruct",
+            "ministral-3:8b": "mistralai/ministral-8b",
+            "phi4-mini:latest": "microsoft/phi-4-mini-instruct",
+            "gemma4:latest": "google/gemma-3-12b-it"
+        }
+        if model in model_mapping:
+            target_model = model_mapping[model]
 
     payload = {
         "model": target_model,
@@ -135,35 +186,44 @@ def query_gemini_sync(model: str, messages: list) -> str:
         return ""
 
 def query_model_sync(model: str, messages: list) -> str:
-    # 1. Route Gemini requests directly to Gemini API if the key is available
+    # 1. Prefer local Ollama if the model is installed locally
+    if is_model_in_ollama(model):
+        response = query_ollama_sync(model, messages)
+        if response:
+            return response
+
+    # 2. Route Gemini requests directly to Gemini API if the key is available
     if GEMINI_API_KEY and "gemini" in model.lower():
         gemini_model = "gemini-2.5-flash" if "flash" in model.lower() else "gemini-2.5-pro"
         return query_gemini_sync(gemini_model, messages)
         
-    # 2. Prefer real OpenRouter API key if set (and not pointing to local Ollama)
+    # 3. Prefer real OpenRouter API key if set (and not pointing to local Ollama)
     if OPENROUTER_API_KEY and OPENROUTER_API_KEY != "ollama":
         return query_openrouter_sync(model, messages)
         
-    # 3. If OPENROUTER_API_KEY is explicitly 'ollama' or has local URL, run it via the mapped Ollama completions endpoint
+    # 4. If OPENROUTER_API_KEY is explicitly 'ollama' or has local URL, run it via the mapped Ollama completions endpoint
     if OPENROUTER_API_KEY == "ollama" or "localhost" in OPENROUTER_API_URL or "127.0.0.1" in OPENROUTER_API_URL:
         return query_openrouter_sync(model, messages)
         
-    # 4. If GEMINI_API_KEY is set but no OpenRouter key is set, use Gemini as a general fallback
+    # 5. If GEMINI_API_KEY is set but no OpenRouter key is set, use Gemini as a general fallback
     if GEMINI_API_KEY:
         gemini_model = "gemini-2.5-flash" if "flash" in model.lower() else "gemini-2.5-pro"
         return query_gemini_sync(gemini_model, messages)
         
-    # 5. Generic fallback to local Ollama API
+    # 6. Generic fallback to local Ollama API
     url = "http://localhost:11434/api/chat"
     payload = {
-        "model": "qwen2.5:14b-instruct",
+        "model": model,
         "messages": messages,
+        "options": {
+            "num_ctx": 32768
+        },
         "stream": False
     }
     headers = {"Content-Type": "application/json"}
     req = urllib.request.Request(url, data=json.dumps(payload).encode("utf-8"), headers=headers, method="POST")
     try:
-        with urllib.request.urlopen(req, timeout=120.0) as response:
+        with urllib.request.urlopen(req, timeout=360.0) as response:
             res_data = json.loads(response.read().decode("utf-8"))
             return res_data.get("message", {}).get("content", "")
     except Exception as e:
@@ -217,7 +277,8 @@ async def main():
     print("           SOFTWARE COUNCIL CONSENSUS ENGINE", flush=True)
     print("=======================================================\n", flush=True)
 
-    sem = asyncio.Semaphore(2)
+    # Use concurrency of 1 to prevent Ollama model VRAM thrashing on local hardware
+    sem = asyncio.Semaphore(1)
 
     async def query_with_sem(model, messages, role_msg):
         async with sem:
