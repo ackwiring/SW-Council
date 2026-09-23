@@ -27,7 +27,14 @@ COUNCIL_MODELS = [
 ]
 CHAIRMAN_MODEL = "gemma4:latest"
 
-# Try to load environment variables from .env file if it exists (for direct CLI execution)
+# Only these names are read from a .env file. The search starts in the repo being
+# audited, so a blanket load would copy that project's own secrets into this
+# process (and the git subprocesses it spawns). OPENROUTER_API_URL is deliberately
+# excluded: a .env in an audited repo could otherwise point it at any server and
+# receive the OpenRouter Bearer key. Set it in the real environment instead.
+DOTENV_ALLOWED_KEYS = {"OPENROUTER_API_KEY", "GEMINI_API_KEY"}
+
+# Try to load API keys from a .env file if it exists (for direct CLI execution)
 def load_dotenv():
     # Look in current directory and parent directories up to 4 levels
     current = os.path.abspath(os.getcwd())
@@ -44,7 +51,10 @@ def load_dotenv():
                                 k, v = parts[0].strip(), parts[1].strip()
                                 if (v.startswith('"') and v.endswith('"')) or (v.startswith("'") and v.endswith("'")):
                                     v = v[1:-1]
-                                os.environ[k] = v
+                                # Skip non-key names, and never override a key already set
+                                # in the shell (e.g. ~/.zshenv) with one from a repo's .env.
+                                if k in DOTENV_ALLOWED_KEYS and not os.environ.get(k):
+                                    os.environ[k] = v
             except Exception:
                 pass
             break
@@ -170,12 +180,14 @@ def query_gemini_sync(model: str, messages: list) -> str:
     for msg in messages:
         parts.append({"text": f"{msg['role'].upper()}: {msg['content']}"})
         
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={GEMINI_API_KEY}"
+    # The key travels in the x-goog-api-key header, not a ?key= query string: URLs
+    # are routinely written to proxy/server logs and exception tracebacks.
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
     payload = {
         "contents": [{"parts": parts}]
     }
-    
-    headers = {"Content-Type": "application/json"}
+
+    headers = {"Content-Type": "application/json", "x-goog-api-key": GEMINI_API_KEY}
     req = urllib.request.Request(url, data=json.dumps(payload).encode("utf-8"), headers=headers, method="POST")
     try:
         with urllib.request.urlopen(req, timeout=120.0) as response:
