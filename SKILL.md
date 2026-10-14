@@ -9,8 +9,8 @@ This skill runs a parallel multi-model consensus deliberation engine against act
 
 ## Quick Start
 
-Invoke the skill script directly:
+Run the script from the repository you want reviewed (it audits that repo's `git diff`), using the path of this skill's folder (where this SKILL.md lives), e.g. `~/.claude/skills/sw-council`:
 
 ```bash
-python C:/Users/MatthewWebster/skills/skills/sw-council/scripts/sw_deliberate.py
+python <skill-folder>/scripts/sw_deliberate.py
 ```
