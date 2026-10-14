@@ -25,7 +25,7 @@ COUNCIL_MODELS = [
     "ministral-3:8b",
     "phi4-mini:latest"
 ]
-CHAIRMAN_MODEL = "gemma4:latest"
+CHAIRMAN_MODEL = "gemma4:12b"
 
 # Only these names are read from a .env file. The search starts in the repo being
 # audited, so a blanket load would copy that project's own secrets into this
@@ -152,7 +152,7 @@ def query_openrouter_sync(model: str, messages: list) -> str:
             "nemotron-mini:latest": "nvidia/nemotron-mini-4b-instruct",
             "ministral-3:8b": "mistralai/ministral-8b",
             "phi4-mini:latest": "microsoft/phi-4-mini-instruct",
-            "gemma4:latest": "google/gemma-3-12b-it"
+            "gemma4:12b": "google/gemma-3-12b-it"
         }
         if model in model_mapping:
             target_model = model_mapping[model]
