@@ -284,23 +284,32 @@ async def query_model_async(executor, model: str, messages: list) -> str:
     loop = asyncio.get_running_loop()
     return await loop.run_in_executor(executor, query_model_sync, model, messages)
 
-def parse_ranking_from_text(ranking_text: str) -> list:
-    import re
-    if "FINAL RANKING:" in ranking_text:
-        parts = ranking_text.split("FINAL RANKING:")
-        if len(parts) >= 2:
-            ranking_section = parts[1]
-            numbered_matches = re.findall(r'\d+\.\s*Response [A-Z]', ranking_section)
-            if numbered_matches:
-                return [re.search(r'Response [A-Z]', m).group() for m in numbered_matches]
-            return re.findall(r'Response [A-Z]', ranking_section)
-    return re.findall(r'Response [A-Z]', ranking_text)
+def parse_ranking_from_text(ranking_text: str, valid_labels=None) -> list:
+    """Labels in ranked order from the FINAL RANKING section, each counted once.
+
+    Positions used to come from every "Response X" mention, so repeats,
+    made-up labels (Response L with only 8 reviews) and, when a model skipped
+    the FINAL RANKING block, every mention in its whole evaluation all counted
+    as ranks -- producing averages like 12.0 out of 8. A model that gives no
+    FINAL RANKING section now contributes no ranking.
+    """
+    if "FINAL RANKING:" not in ranking_text:
+        return []
+    ranking_section = ranking_text.split("FINAL RANKING:")[-1]
+    numbered = re.findall(r'^\s*\d+\.\s*\**\s*(Response [A-Z])\b', ranking_section, re.MULTILINE)
+    labels = numbered or re.findall(r'Response [A-Z]\b', ranking_section)
+    ranked = []
+    for label in labels:
+        if label in ranked or (valid_labels is not None and label not in valid_labels):
+            continue
+        ranked.append(label)
+    return ranked
 
 def calculate_aggregate_rankings(stage2_results: list, label_to_model: dict) -> list:
     from collections import defaultdict
     model_positions = defaultdict(list)
     for result in stage2_results:
-        parsed = parse_ranking_from_text(result['ranking'])
+        parsed = parse_ranking_from_text(result['ranking'], set(label_to_model))
         for position, label in enumerate(parsed, start=1):
             if label in label_to_model:
                 model_positions[label_to_model[label]].append(position)
