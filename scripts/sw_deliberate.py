@@ -21,7 +21,7 @@ COUNCIL_MODELS = [
     "gemma3:12b",
     "deepseek-r1:8b",
     "deepseek-coder:6.7b",
-    "nemotron-mini:latest",
+    "nemotron-3-nano:4b",
     "ministral-3:8b",
     "phi4-mini:latest"
 ]
@@ -149,7 +149,7 @@ def query_openrouter_sync(model: str, messages: list) -> str:
             "gemma3:12b": "google/gemma-3-12b-it",
             "deepseek-r1:8b": "deepseek/deepseek-r1-distill-llama-8b",
             "deepseek-coder:6.7b": "deepseek/deepseek-coder-6.7b-instruct",
-            "nemotron-mini:latest": "nvidia/nemotron-mini-4b-instruct",
+            "nemotron-3-nano:4b": "nvidia/nemotron-3-nano-30b-a3b",
             "ministral-3:8b": "mistralai/ministral-8b",
             "phi4-mini:latest": "microsoft/phi-4-mini-instruct",
             "gemma4:12b": "google/gemma-3-12b-it"
