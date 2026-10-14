@@ -28,6 +28,27 @@ COUNCIL_MODELS = [
 ]
 CHAIRMAN_MODEL = "gemma4:12b"
 
+# SW_COUNCIL_PROFILE=fast trades depth for speed -- minutes per review on a
+# 12 GB GPU instead of up to an hour: four advisors (the best-ranked fast ones
+# from real runs), no peer-review stage, a context small enough to stay on the
+# GPU, and capped reply lengths. "full" (the default) is the original council.
+# Each setting can also be overridden on its own with the variables below.
+PROFILES = {
+    "full": {"models": COUNCIL_MODELS, "peer_review": True, "max_ctx": 65536,
+             "max_reply": 0, "max_chair": 0},
+    "fast": {"models": ["gemma3:12b", "qwen2.5-coder:latest", "glm4:latest", "nemotron-3-nano:4b"],
+             "peer_review": False, "max_ctx": 24576, "max_reply": 1024, "max_chair": 1536},
+}
+PROFILE_NAME = os.getenv("SW_COUNCIL_PROFILE", "full").strip().lower()
+PROFILE = PROFILES.get(PROFILE_NAME, PROFILES["full"])
+if os.getenv("SW_COUNCIL_MODELS"):
+    COUNCIL_MODELS = [m.strip() for m in os.getenv("SW_COUNCIL_MODELS").split(",") if m.strip()]
+else:
+    COUNCIL_MODELS = PROFILE["models"]
+PEER_REVIEW = os.getenv("SW_COUNCIL_PEER_REVIEW", "1" if PROFILE["peer_review"] else "0").lower() not in ("0", "false", "no")
+MAX_REPLY_TOKENS = int(os.getenv("SW_COUNCIL_MAX_REPLY_TOKENS", PROFILE["max_reply"]))  # 0 = no cap
+MAX_CHAIR_TOKENS = int(os.getenv("SW_COUNCIL_MAX_CHAIR_TOKENS", PROFILE["max_chair"]))  # 0 = no cap
+
 # Only these names are read from a .env file. The search starts in the repo being
 # audited, so a blanket load would copy that project's own secrets into this
 # process (and the git subprocesses it spawns). OPENROUTER_API_URL is deliberately
@@ -102,29 +123,41 @@ def is_model_in_ollama(model: str) -> bool:
 # num_ctx is now sized per request: at least MIN_CTX, grown to fit the prompt,
 # capped by the model's own trained context and by SW_COUNCIL_MAX_CTX (larger
 # contexts may spill onto the CPU, which is slower but still completes).
-MIN_CTX = 32768
-MAX_CTX = int(os.getenv("SW_COUNCIL_MAX_CTX", "65536"))
-REPLY_TOKENS = 4096
+MAX_CTX = int(os.getenv("SW_COUNCIL_MAX_CTX", PROFILE["max_ctx"]))
+MIN_CTX = min(32768, MAX_CTX)
+# Room left for the model's reply: the reply cap plus a margin when one is set.
+REPLY_TOKENS = max(MAX_REPLY_TOKENS, MAX_CHAIR_TOKENS) + 512 if MAX_REPLY_TOKENS and MAX_CHAIR_TOKENS else 4096
 CHARS_PER_TOKEN = 3  # conservative for code-heavy prompts
 
 _context_limits = {}
+_capabilities = {}
+
+def _load_model_info(model: str) -> None:
+    limit, capabilities = MAX_CTX, []
+    try:
+        req = urllib.request.Request("http://localhost:11434/api/show",
+                                     data=json.dumps({"model": model}).encode("utf-8"),
+                                     headers={"Content-Type": "application/json"}, method="POST")
+        with urllib.request.urlopen(req, timeout=10.0) as response:
+            shown = json.loads(response.read().decode("utf-8"))
+        trained = [v for k, v in shown.get("model_info", {}).items() if k.endswith(".context_length")]
+        if trained:
+            limit = min(MAX_CTX, int(trained[0]))
+        capabilities = shown.get("capabilities") or []
+    except Exception:
+        pass
+    _context_limits[model] = limit
+    _capabilities[model] = capabilities
 
 def model_context_limit(model: str) -> int:
     if model not in _context_limits:
-        limit = MAX_CTX
-        try:
-            req = urllib.request.Request("http://localhost:11434/api/show",
-                                         data=json.dumps({"model": model}).encode("utf-8"),
-                                         headers={"Content-Type": "application/json"}, method="POST")
-            with urllib.request.urlopen(req, timeout=10.0) as response:
-                info = json.loads(response.read().decode("utf-8")).get("model_info", {})
-            trained = [v for k, v in info.items() if k.endswith(".context_length")]
-            if trained:
-                limit = min(MAX_CTX, int(trained[0]))
-        except Exception:
-            pass
-        _context_limits[model] = limit
+        _load_model_info(model)
     return _context_limits[model]
+
+def is_thinking_model(model: str) -> bool:
+    if model not in _capabilities:
+        _load_model_info(model)
+    return "thinking" in _capabilities[model]
 
 def estimate_tokens(messages: list) -> int:
     return sum(len(m["content"]) for m in messages) // CHARS_PER_TOKEN + 64 * len(messages)
@@ -144,25 +177,32 @@ def fit_diff(diff: str, model: str, other_chars: int) -> str:
     print(f"   ⚠️ Diff trimmed for {model}: kept {keep} of {len(diff)} chars to fit its {model_context_limit(model)}-token context.", flush=True)
     return diff[:keep] + f"\n\n[... diff truncated: {len(diff) - keep} more characters not shown ...]\n"
 
-def ollama_chat(model: str, messages: list) -> str:
+def ollama_chat(model: str, messages: list, max_tokens: int = 0) -> str:
     url = "http://localhost:11434/api/chat"
+    options = {"num_ctx": num_ctx_for(model, messages)}
+    if max_tokens:
+        options["num_predict"] = max_tokens
     payload = {
         "model": model,
         "messages": messages,
-        "options": {
-            "num_ctx": num_ctx_for(model, messages)
-        },
+        "options": options,
         "stream": False
     }
+    # Thinking models (nemotron-3-nano, gemma4) spend tokens on hidden reasoning
+    # first; under a reply cap that can use the whole budget and return empty
+    # content (seen live: nemotron skipped as "no response"). Ask for the
+    # answer directly -- faster, and the review is the part we read.
+    if is_thinking_model(model):
+        payload["think"] = False
     headers = {"Content-Type": "application/json"}
     req = urllib.request.Request(url, data=json.dumps(payload).encode("utf-8"), headers=headers, method="POST")
     with urllib.request.urlopen(req, timeout=600.0) as response:
         res_data = json.loads(response.read().decode("utf-8"))
         return res_data.get("message", {}).get("content", "")
 
-def query_ollama_sync(model: str, messages: list) -> str:
+def query_ollama_sync(model: str, messages: list, max_tokens: int = 0) -> str:
     try:
-        return ollama_chat(model, messages)
+        return ollama_chat(model, messages, max_tokens)
     except Exception as e:
         print(f"⚠️ Error querying local Ollama model {model}: {e}")
         return ""
@@ -249,10 +289,10 @@ def query_gemini_sync(model: str, messages: list) -> str:
         print(f"⚠️ Error querying Gemini model {model}: {e}")
         return ""
 
-def query_model_sync(model: str, messages: list) -> str:
+def query_model_sync(model: str, messages: list, max_tokens: int = 0) -> str:
     # 1. Prefer local Ollama if the model is installed locally
     if is_model_in_ollama(model):
-        response = query_ollama_sync(model, messages)
+        response = query_ollama_sync(model, messages, max_tokens)
         if response:
             return response
 
@@ -278,11 +318,11 @@ def query_model_sync(model: str, messages: list) -> str:
     # this installed model -- retrying the identical request just fails again)
     if is_model_in_ollama(model):
         return ""
-    return query_ollama_sync(model, messages)
+    return query_ollama_sync(model, messages, max_tokens)
 
-async def query_model_async(executor, model: str, messages: list) -> str:
+async def query_model_async(executor, model: str, messages: list, max_tokens: int = 0) -> str:
     loop = asyncio.get_running_loop()
-    return await loop.run_in_executor(executor, query_model_sync, model, messages)
+    return await loop.run_in_executor(executor, query_model_sync, model, messages, max_tokens)
 
 def parse_ranking_from_text(ranking_text: str, valid_labels=None) -> list:
     """Labels in ranked order from the FINAL RANKING section, each counted once.
@@ -348,18 +388,19 @@ async def main():
     
     print("\n=======================================================", flush=True)
     print("           SOFTWARE COUNCIL CONSENSUS ENGINE", flush=True)
-    print("=======================================================\n", flush=True)
+    print("=======================================================", flush=True)
+    print(f"Profile: {PROFILE_NAME} | advisors: {len(COUNCIL_MODELS)} | peer review: {'on' if PEER_REVIEW else 'off'} | max context: {MAX_CTX}\n", flush=True)
 
     # Use concurrency of 1 to prevent Ollama model VRAM thrashing on local hardware
     sem = asyncio.Semaphore(1)
 
-    async def query_with_sem(model, messages, role_msg):
+    async def query_with_sem(model, messages, role_msg, max_tokens=0):
         async with sem:
             print(f"   ↳ [Active] {role_msg}: {model}...", flush=True)
             # One model failing must not abort the whole council (asyncio.gather
             # re-raises the first exception); drop it and carry on with the rest.
             try:
-                res = await query_model_async(executor, model, messages)
+                res = await query_model_async(executor, model, messages, max_tokens)
             except Exception as e:
                 print(f"   ⚠️ [Skipped] {role_msg}: {model} failed: {e}", flush=True)
                 return ""
@@ -381,7 +422,7 @@ async def main():
             {"role": "system", "content": stage1_system},
             {"role": "user", "content": f"{stage1_intro}{model_diff}"}
         ]
-        stage1_tasks.append(query_with_sem(model, messages, "Querying advisor"))
+        stage1_tasks.append(query_with_sem(model, messages, "Querying advisor", MAX_REPLY_TOKENS))
         
     responses = await asyncio.gather(*stage1_tasks)
     
@@ -397,67 +438,75 @@ async def main():
     print(f"✅ Step 1 has been completed - successfully collected code audit feedback from {len(stage1_results)} separate model personas.", flush=True)
 
     # --- STEP 2 ---
-    print("\n🌀 Step 2: Stage 2 (Peer Review and Ranking) has started...", flush=True)
+    # Peer review re-reads the diff plus every review once per model, which
+    # made it the slowest stage; the fast profile skips it (SW_COUNCIL_PEER_REVIEW).
+    if PEER_REVIEW:
+        print("\n🌀 Step 2: Stage 2 (Peer Review and Ranking) has started...", flush=True)
     
-    labels = [chr(65 + i) for i in range(len(stage1_results))]
-    label_to_model = {f"Response {l}": res['model'] for l, res in zip(labels, stage1_results)}
+        labels = [chr(65 + i) for i in range(len(stage1_results))]
+        label_to_model = {f"Response {l}": res['model'] for l, res in zip(labels, stage1_results)}
     
-    responses_text = "\n\n".join([f"Response {l}:\n{res['response']}" for l, res in zip(labels, stage1_results)])
+        responses_text = "\n\n".join([f"Response {l}:\n{res['response']}" for l, res in zip(labels, stage1_results)])
     
-    # Built per model, because the diff is trimmed to each model's context.
-    ranking_template = """You are evaluating different code reviews of the following git diff:
+        # Built per model, because the diff is trimmed to each model's context.
+        ranking_template = """You are evaluating different code reviews of the following git diff:
 
---- GIT DIFF ---
-{diff}
----
+    --- GIT DIFF ---
+    {diff}
+    ---
 
-Here are the code reviews from different models (anonymized):
+    Here are the code reviews from different models (anonymized):
 
-{responses_text}
+    {responses_text}
 
-Your task:
-1. First, evaluate each response (Response A, B, C...) individually. Note its strengths and blind spots.
-2. Provide a final ranking.
+    Your task:
+    1. First, evaluate each response (Response A, B, C...) individually. Note its strengths and blind spots.
+    2. Provide a final ranking.
 
-Your final ranking MUST be formatted EXACTLY as follows at the very end of your response:
-FINAL RANKING:
-1. Response C
-2. Response A
-3. Response B
+    Your final ranking MUST be formatted EXACTLY as follows at the very end of your response:
+    FINAL RANKING:
+    1. Response C
+    2. Response A
+    3. Response B
 
-Now provide your evaluation and ranking:"""
+    Now provide your evaluation and ranking:"""
 
-    stage2_system = "You are a software peer reviewer. Compare and rank the other reviews fairly."
-    stage2_tasks = []
-    for result in stage1_results:
-        other_chars = len(stage2_system) + len(ranking_template) + len(responses_text)
-        model_diff = fit_diff(diff, result['model'], other_chars)
-        ranking_prompt = ranking_template.format(diff=model_diff, responses_text=responses_text)
-        messages = [
-            {"role": "system", "content": stage2_system},
-            {"role": "user", "content": ranking_prompt}
-        ]
-        stage2_tasks.append(query_with_sem(result['model'], messages, "Peer reviewing"))
+        stage2_system = "You are a software peer reviewer. Compare and rank the other reviews fairly."
+        stage2_tasks = []
+        for result in stage1_results:
+            other_chars = len(stage2_system) + len(ranking_template) + len(responses_text)
+            model_diff = fit_diff(diff, result['model'], other_chars)
+            ranking_prompt = ranking_template.format(diff=model_diff, responses_text=responses_text)
+            messages = [
+                {"role": "system", "content": stage2_system},
+                {"role": "user", "content": ranking_prompt}
+            ]
+            stage2_tasks.append(query_with_sem(result['model'], messages, "Peer reviewing"))
         
-    rankings_resp = await asyncio.gather(*stage2_tasks)
+        rankings_resp = await asyncio.gather(*stage2_tasks)
     
-    stage2_results = []
-    for result, ranking in zip(stage1_results, rankings_resp):
-        if ranking:
-            stage2_results.append({
-                "model": result['model'],
-                "ranking": ranking
-            })
+        stage2_results = []
+        for result, ranking in zip(stage1_results, rankings_resp):
+            if ranking:
+                stage2_results.append({
+                    "model": result['model'],
+                    "ranking": ranking
+                })
             
-    aggregate = calculate_aggregate_rankings(stage2_results, label_to_model)
-    aggregate_str = ", ".join([f"{item['model']} (avg rank: {item['average_rank']})" for item in aggregate])
-    print(f"✅ Step 2 has been completed - peer rankings collected and consensus computed: {aggregate_str}.", flush=True)
+        aggregate = calculate_aggregate_rankings(stage2_results, label_to_model)
+        aggregate_str = ", ".join([f"{item['model']} (avg rank: {item['average_rank']})" for item in aggregate])
+        print(f"✅ Step 2 has been completed - peer rankings collected and consensus computed: {aggregate_str}.", flush=True)
+    else:
+        print("\n🌀 Step 2: Stage 2 (Peer Review and Ranking) has started...", flush=True)
+        print("✅ Step 2 has been skipped - peer review is off for this profile; the chairman works from the Stage 1 reviews.", flush=True)
+        stage2_results = []
 
     # --- STEP 3 ---
     print("\n🌀 Step 3: Stage 3 (Chairman Synthesis) has started...", flush=True)
     
     stage1_text = "\n\n".join([f"Model: {res['model']}\nResponse: {res['response']}" for res in stage1_results])
-    stage2_text = "\n\n".join([f"Model: {res['model']}\nRanking: {res['ranking']}" for res in stage2_results])
+    stage2_text = "\n\n".join([f"Model: {res['model']}\nRanking: {res['ranking']}" for res in stage2_results]) \
+        or "(Peer review was skipped for this run; weigh the Stage 1 reviews directly.)"
     
     chairman_system = "You are the Software Council Chairman. Provide a clear, actionable synthesis."
     chairman_diff = fit_diff(diff, CHAIRMAN_MODEL, len(chairman_system) + len(stage1_text) + len(stage2_text) + 1024)
@@ -488,7 +537,7 @@ COUNCIL_VERDICT: REJECTED
         {"role": "user", "content": chairman_prompt}
     ]
 
-    final_report = await query_model_async(executor, CHAIRMAN_MODEL, messages)
+    final_report = await query_model_async(executor, CHAIRMAN_MODEL, messages, MAX_CHAIR_TOKENS)
     if not final_report:
         print(f"❌ Step 3 failed: chairman model {CHAIRMAN_MODEL} returned no synthesis.", flush=True)
         sys.exit(1)
