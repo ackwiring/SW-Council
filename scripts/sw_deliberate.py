@@ -2,6 +2,7 @@
 import os
 import sys
 import json
+import re
 import urllib.request
 import urllib.error
 import subprocess
@@ -95,22 +96,73 @@ def is_model_in_ollama(model: str) -> bool:
     except Exception:
         return False
 
-def query_ollama_sync(model: str, messages: list) -> str:
+# Context sizing for local Ollama requests. A fixed num_ctx of 32768 overflowed
+# as soon as a real app's diff (~30k tokens) was combined with the Stage 1
+# reviews in Stage 2, and Ollama rejects an over-long request with HTTP 400.
+# num_ctx is now sized per request: at least MIN_CTX, grown to fit the prompt,
+# capped by the model's own trained context and by SW_COUNCIL_MAX_CTX (larger
+# contexts may spill onto the CPU, which is slower but still completes).
+MIN_CTX = 32768
+MAX_CTX = int(os.getenv("SW_COUNCIL_MAX_CTX", "65536"))
+REPLY_TOKENS = 4096
+CHARS_PER_TOKEN = 3  # conservative for code-heavy prompts
+
+_context_limits = {}
+
+def model_context_limit(model: str) -> int:
+    if model not in _context_limits:
+        limit = MAX_CTX
+        try:
+            req = urllib.request.Request("http://localhost:11434/api/show",
+                                         data=json.dumps({"model": model}).encode("utf-8"),
+                                         headers={"Content-Type": "application/json"}, method="POST")
+            with urllib.request.urlopen(req, timeout=10.0) as response:
+                info = json.loads(response.read().decode("utf-8")).get("model_info", {})
+            trained = [v for k, v in info.items() if k.endswith(".context_length")]
+            if trained:
+                limit = min(MAX_CTX, int(trained[0]))
+        except Exception:
+            pass
+        _context_limits[model] = limit
+    return _context_limits[model]
+
+def estimate_tokens(messages: list) -> int:
+    return sum(len(m["content"]) for m in messages) // CHARS_PER_TOKEN + 64 * len(messages)
+
+def num_ctx_for(model: str, messages: list) -> int:
+    needed = estimate_tokens(messages) + REPLY_TOKENS
+    ctx = max(MIN_CTX, -(-needed // 8192) * 8192)
+    return min(ctx, model_context_limit(model))
+
+def fit_diff(diff: str, model: str, other_chars: int) -> str:
+    """Trim the diff (never the reviews or instructions) so the prompt fits the model's context."""
+    budget_tokens = model_context_limit(model) - REPLY_TOKENS - 256
+    budget_chars = budget_tokens * CHARS_PER_TOKEN - other_chars
+    if len(diff) <= budget_chars:
+        return diff
+    keep = max(budget_chars, 0)
+    print(f"   ⚠️ Diff trimmed for {model}: kept {keep} of {len(diff)} chars to fit its {model_context_limit(model)}-token context.", flush=True)
+    return diff[:keep] + f"\n\n[... diff truncated: {len(diff) - keep} more characters not shown ...]\n"
+
+def ollama_chat(model: str, messages: list) -> str:
     url = "http://localhost:11434/api/chat"
     payload = {
         "model": model,
         "messages": messages,
         "options": {
-            "num_ctx": 32768
+            "num_ctx": num_ctx_for(model, messages)
         },
         "stream": False
     }
     headers = {"Content-Type": "application/json"}
     req = urllib.request.Request(url, data=json.dumps(payload).encode("utf-8"), headers=headers, method="POST")
+    with urllib.request.urlopen(req, timeout=600.0) as response:
+        res_data = json.loads(response.read().decode("utf-8"))
+        return res_data.get("message", {}).get("content", "")
+
+def query_ollama_sync(model: str, messages: list) -> str:
     try:
-        with urllib.request.urlopen(req, timeout=360.0) as response:
-            res_data = json.loads(response.read().decode("utf-8"))
-            return res_data.get("message", {}).get("content", "")
+        return ollama_chat(model, messages)
     except Exception as e:
         print(f"⚠️ Error querying local Ollama model {model}: {e}")
         return ""
@@ -222,24 +274,11 @@ def query_model_sync(model: str, messages: list) -> str:
         gemini_model = "gemini-2.5-flash" if "flash" in model.lower() else "gemini-2.5-pro"
         return query_gemini_sync(gemini_model, messages)
         
-    # 6. Generic fallback to local Ollama API
-    url = "http://localhost:11434/api/chat"
-    payload = {
-        "model": model,
-        "messages": messages,
-        "options": {
-            "num_ctx": 32768
-        },
-        "stream": False
-    }
-    headers = {"Content-Type": "application/json"}
-    req = urllib.request.Request(url, data=json.dumps(payload).encode("utf-8"), headers=headers, method="POST")
-    try:
-        with urllib.request.urlopen(req, timeout=360.0) as response:
-            res_data = json.loads(response.read().decode("utf-8"))
-            return res_data.get("message", {}).get("content", "")
-    except Exception as e:
-        raise RuntimeError(f"No API keys configured, and failed to connect to local Ollama: {e}")
+    # 6. Generic fallback to local Ollama API (skipped if step 1 already tried
+    # this installed model -- retrying the identical request just fails again)
+    if is_model_in_ollama(model):
+        return ""
+    return query_ollama_sync(model, messages)
 
 async def query_model_async(executor, model: str, messages: list) -> str:
     loop = asyncio.get_running_loop()
@@ -277,6 +316,19 @@ def calculate_aggregate_rankings(stage2_results: list, label_to_model: dict) -> 
     aggregate.sort(key=lambda x: x['average_rank'])
     return aggregate
 
+def parse_verdict(report: str):
+    """APPROVED, REJECTED, or None when the chairman's ruling can't be read."""
+    patterns = [
+        r"COUNCIL_VERDICT:\s*\**\s*(APPROVED|REJECTED)",
+        r"STATUS:\s*\**\s*(APPROVED|REJECTED)",
+        r"Ruling\W*\s*(Approve|Reject)",
+    ]
+    for pattern in patterns:
+        matches = re.findall(pattern, report, re.IGNORECASE)
+        if matches:
+            return "APPROVED" if matches[-1].lower().startswith("approve") else "REJECTED"
+    return None
+
 async def main():
     diff = get_git_diff()
     if not diff:
@@ -295,7 +347,16 @@ async def main():
     async def query_with_sem(model, messages, role_msg):
         async with sem:
             print(f"   ↳ [Active] {role_msg}: {model}...", flush=True)
-            res = await query_model_async(executor, model, messages)
+            # One model failing must not abort the whole council (asyncio.gather
+            # re-raises the first exception); drop it and carry on with the rest.
+            try:
+                res = await query_model_async(executor, model, messages)
+            except Exception as e:
+                print(f"   ⚠️ [Skipped] {role_msg}: {model} failed: {e}", flush=True)
+                return ""
+            if not res:
+                print(f"   ⚠️ [Skipped] {role_msg}: {model} returned no response", flush=True)
+                return ""
             print(f"   ✓ [Done] {role_msg}: {model}", flush=True)
             return res
 
@@ -304,9 +365,12 @@ async def main():
     
     stage1_tasks = []
     for model in COUNCIL_MODELS:
+        stage1_system = "You are a software design auditor. Evaluate the git diff changes thoroughly."
+        stage1_intro = "Review this git diff and provide your feedback:\n\n"
+        model_diff = fit_diff(diff, model, len(stage1_system) + len(stage1_intro))
         messages = [
-            {"role": "system", "content": "You are a software design auditor. Evaluate the git diff changes thoroughly."},
-            {"role": "user", "content": f"Review this git diff and provide your feedback:\n\n{diff}"}
+            {"role": "system", "content": stage1_system},
+            {"role": "user", "content": f"{stage1_intro}{model_diff}"}
         ]
         stage1_tasks.append(query_with_sem(model, messages, "Querying advisor"))
         
@@ -331,7 +395,8 @@ async def main():
     
     responses_text = "\n\n".join([f"Response {l}:\n{res['response']}" for l, res in zip(labels, stage1_results)])
     
-    ranking_prompt = f"""You are evaluating different code reviews of the following git diff:
+    # Built per model, because the diff is trimmed to each model's context.
+    ranking_template = """You are evaluating different code reviews of the following git diff:
 
 --- GIT DIFF ---
 {diff}
@@ -353,10 +418,14 @@ FINAL RANKING:
 
 Now provide your evaluation and ranking:"""
 
+    stage2_system = "You are a software peer reviewer. Compare and rank the other reviews fairly."
     stage2_tasks = []
     for result in stage1_results:
+        other_chars = len(stage2_system) + len(ranking_template) + len(responses_text)
+        model_diff = fit_diff(diff, result['model'], other_chars)
+        ranking_prompt = ranking_template.format(diff=model_diff, responses_text=responses_text)
         messages = [
-            {"role": "system", "content": "You are a software peer reviewer. Compare and rank the other reviews fairly."},
+            {"role": "system", "content": stage2_system},
             {"role": "user", "content": ranking_prompt}
         ]
         stage2_tasks.append(query_with_sem(result['model'], messages, "Peer reviewing"))
@@ -381,10 +450,12 @@ Now provide your evaluation and ranking:"""
     stage1_text = "\n\n".join([f"Model: {res['model']}\nResponse: {res['response']}" for res in stage1_results])
     stage2_text = "\n\n".join([f"Model: {res['model']}\nRanking: {res['ranking']}" for res in stage2_results])
     
+    chairman_system = "You are the Software Council Chairman. Provide a clear, actionable synthesis."
+    chairman_diff = fit_diff(diff, CHAIRMAN_MODEL, len(chairman_system) + len(stage1_text) + len(stage2_text) + 1024)
     chairman_prompt = f"""You are the Software Council Chairman. Synthesize the following code reviews and peer rankings into a definitive, final code audit report and action plan.
 
 User Git Diff:
-{diff}
+{chairman_diff}
 
 STAGE 1 Reviews:
 {stage1_text}
@@ -396,21 +467,39 @@ Provide:
 1. **Ruling**: Approve or Reject (needs another revision loop).
 2. **Core Justification**: Key reasons for the ruling.
 3. **Action Plan**: Detailed concrete action steps to address findings.
+
+End your report with exactly one final line, either
+COUNCIL_VERDICT: APPROVED
+or
+COUNCIL_VERDICT: REJECTED
 """
 
     messages = [
-        {"role": "system", "content": "You are the Software Council Chairman. Provide a clear, actionable synthesis."},
+        {"role": "system", "content": chairman_system},
         {"role": "user", "content": chairman_prompt}
     ]
-    
+
     final_report = await query_model_async(executor, CHAIRMAN_MODEL, messages)
+    if not final_report:
+        print(f"❌ Step 3 failed: chairman model {CHAIRMAN_MODEL} returned no synthesis.", flush=True)
+        sys.exit(1)
     print("✅ Step 3 has been completed - chairman has synthesized the final consensus report and generated the action plan.", flush=True)
     
     print("\n=======================================================", flush=True)
     print("                 FINAL DELIBERATION REPORT", flush=True)
     print("=======================================================\n", flush=True)
-    print(final_report, flush=True)
+    verdict = parse_verdict(final_report)
+    # Callers (auto-format's UI) read the verdict from this one normalized line,
+    # so the chairman's own copies are removed rather than printed twice.
+    print(re.sub(r"(?im)^.*COUNCIL_VERDICT:.*$\n?", "", final_report).rstrip(), flush=True)
     print("\n=======================================================", flush=True)
+    if verdict is None:
+        print("COUNCIL_VERDICT: REJECTED", flush=True)
+        print("❌ Could not parse a ruling from the chairman's report; failing closed.", flush=True)
+        sys.exit(2)
+    print(f"COUNCIL_VERDICT: {verdict}", flush=True)
+    # Exit code is the gate: 0 only for APPROVED (and for "no changes" above).
+    sys.exit(0 if verdict == "APPROVED" else 1)
 
 if __name__ == "__main__":
     asyncio.run(main())
