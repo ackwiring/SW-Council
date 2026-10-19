@@ -1,0 +1,18 @@
+{
+  "_comment": "Model ids for the Software Council (PRD change 5: ids in config, not code). Lenses get lens_models round-robin, so put the small fast models first; the chairman gets the strongest. Prefix an id with ollama:, openrouter:, gemini: or fake: to pin its provider and send the id unchanged; a bare id keeps the automatic routing. Override with --config, SW_COUNCIL_CONFIG, --lens-model, --chairman-model or SW_COUNCIL_MODELS.",
+  "lens_models": [
+    "gemma3:12b",
+    "qwen2.5-coder:latest",
+    "glm4:latest",
+    "nemotron-3-nano:4b",
+    "deepseek-r1:8b",
+    "deepseek-coder:6.7b",
+    "ministral-3:8b",
+    "phi4-mini:latest"
+  ],
+  "chairman_model": "gemma4:12b",
+  "max_lenses": 4,
+  "peer_review": "auto",
+  "dropped_lenses": [],
+  "gemini_default_model": "gemini-2.5-flash"
+}
