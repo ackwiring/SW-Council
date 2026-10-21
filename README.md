@@ -11,7 +11,8 @@ reviewer (ADR-0009), which reads its JSON output.
 graph TD
     A[Diff: working tree, or base...HEAD] --> L[Pick 3-4 lenses for this diff]
     L --> B[Stage 1: each lens reviews rules + deterministic report + the diff by file, answers JSON]
-    B --> M[Merge duplicate findings]
+    B --> G[Ground: set aside tool repeats and findings with no evidence in the release]
+    G --> M[Merge duplicate findings]
     M -->|lenses disagree| C[Stage 2: peers rank the merged findings]
     M -->|lenses agree| D
     C --> D[Stage 3: chairman rules in JSON]
@@ -28,6 +29,21 @@ graph TD
 3. **Structured output.** Each lens answers JSON findings: file, line, severity, message, suggested fix.
    Duplicates are merged across lenses before anything else. There is no `FINAL RANKING:` prose
    parsing any more.
+6. **Grounded findings only.** Before peer review, every lens finding is checked against the diff
+   (`council_core.ground_findings`), with no model involved. A finding is set aside, never blocking and
+   never shown to the chairman, when it:
+   - repeats a deterministic tool finding from `--report` (same file, plus a shared token like a colour
+     or CVE id, or a nearby line on the tool rule's topic). Tool findings keep the tool's rule and
+     severity: the council can refer to them but not re-raise or escalate them;
+   - cites no file, a file not in the diff (ignored folders, build output), or a file the range deletes;
+   - cites no line and no quoted `evidence`, a line the diff does not show, a comment or blank line
+     without a quote, or a quote that is not in the diff near that line;
+   - claims a hard-coded or exposed secret when no cited line assigns a real value (`KEY=` is empty).
+
+   Deleted files are named (`<file-deleted>`) but their old code is not shown to the lenses. The
+   chairman's `blocking_finding_ids` must name grounded findings: unknown ids are dropped; a reject that
+   names none becomes `approve_with_conditions` (with `ruling_note`) when no grounded finding is left,
+   and fails closed (exit 2) when grounded findings exist but none was named.
 4. **Lighter peer review.** Peers rank the merged findings list, not each other's essays. The stage is
    skipped when the lenses already agree, so no 32k context is needed for it.
 5. **Cache and model routing.** Lens results are cached by diff + rules + lens + model
@@ -69,15 +85,22 @@ answered (fails closed).
   "action_plan": ["Use bound parameters in find()"],
   "findings": [
     {"id": "F1", "file": "app/db.py", "line": 2, "lens": "security", "lenses": ["security", "contrarian"],
-     "severity": "high", "blocking": true, "message": "...", "suggested_fix": "..."}
+     "severity": "high", "blocking": true, "message": "...", "evidence": "the quoted line", "suggested_fix": "..."}
   ],
+  "set_aside": [
+    {"file": ".env.example", "line": null, "lens": "security", "severity": "critical", "message": "...",
+     "reason": "cites no line or quoted text"}
+  ],
+  "ruling_note": null,
   "lenses": ["security", "contrarian", "dx", "performance"],
   "models": {"lens": {"security": "gemma3:12b"}, "chairman": "gemma4:12b"},
-  "stats": {"files": 1, "lenses_answered": 4, "cache_hits": 0, "findings": 1, "peer_review": true}
+  "stats": {"files": 1, "lenses_answered": 4, "cache_hits": 0, "findings": 1, "set_aside": 1, "peer_review": true}
 }
 ```
 
-`blocking` is true only for findings the chairman names when it rejects. AOC-QC still decides what blocks.
+`blocking` is true only for findings the chairman names when it rejects. AOC-QC still decides what blocks,
+and re-checks grounding itself. `set_aside` findings are advisory at most; `ruling_note` says when the
+chairman's ruling was held to the grounded findings.
 
 ## Models and providers
 

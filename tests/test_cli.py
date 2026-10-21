@@ -8,6 +8,9 @@ import sys
 import tempfile
 import unittest
 
+sys.path.insert(0, os.path.dirname(__file__))
+import release_fixture as fx  # noqa: E402
+
 SCRIPT = os.path.join(os.path.dirname(__file__), "..", "scripts", "sw_deliberate.py")
 
 SQL_FINDING = {"file": "app/db.py", "line": 2, "severity": "high",
@@ -144,6 +147,88 @@ class Council(unittest.TestCase):
         p = self.run_council(replies, "--format", "json", "--base", "HEAD~1", "--lenses", "dx,outsider", "--no-cache")
         self.assertEqual(p.returncode, 0, p.stderr)
         self.assertEqual(json.loads(p.stdout)["lenses"], ["dx", "outsider"])
+
+
+    # ---- the 2026-10-21 auto-format release runs (tests/release_fixture.py) ----
+
+    def release_repo(self):
+        """First commit has the old Python tool; the release deletes it and adds the app."""
+        def put(path, text):
+            full = os.path.join(self.repo, *path.split("/"))
+            os.makedirs(os.path.dirname(full), exist_ok=True)
+            with open(full, "w", encoding="utf-8", newline="\n") as h:
+                h.write(text)
+        git(self.repo, "checkout", "--", ".")
+        put(fx.DELETED_PY_PATH, fx.DELETED_PY)
+        git(self.repo, "add", "-A")
+        git(self.repo, "commit", "-qm", "old tool")
+        base = subprocess.run(["git", "rev-parse", "HEAD"], cwd=self.repo, capture_output=True, text=True).stdout.strip()
+        git(self.repo, "rm", "-q", fx.DELETED_PY_PATH)
+        put(".env.example", fx.ENV_EXAMPLE)
+        put("src/index.css", fx.INDEX_CSS)
+        put("src/App.jsx", fx.APP_JSX)
+        git(self.repo, "add", "-A")
+        git(self.repo, "commit", "-qm", "release")
+        report = os.path.join(self.tmp.name, "report.json")
+        with open(report, "w", encoding="utf-8") as h:
+            json.dump(fx.REPORT, h)
+        return base, report
+
+    def test_a_reject_built_on_invented_and_tool_repeated_findings_does_not_stand(self):
+        base, report = self.release_repo()
+        replies = {
+            "lens:security": fx.SECURITY_LENS,
+            "lens:performance": fx.PERFORMANCE_LENS,
+            "lens": {"findings": []},
+            "chairman": {"ruling": "reject", "justification": "Critical security finding (F4) in .env.example",
+                         "action_plan": ["Remove secrets"], "blocking_finding_ids": ["F10", "F6", "F7"]},
+        }
+        p = self.run_council(replies, "--format", "json", "--base", base, "--report", report,
+                             "--lenses", "security,performance,contrarian", "--no-cache")
+        self.assertEqual(p.returncode, 0, p.stderr)
+        out = json.loads(p.stdout)
+        self.assertEqual(out["ruling"], "approve_with_conditions")
+        self.assertEqual(out["findings"], [])
+        self.assertEqual(len(out["set_aside"]), len(fx.SECURITY_LENS["findings"]) + len(fx.PERFORMANCE_LENS["findings"]))
+        self.assertIn("no grounded finding", out["ruling_note"])
+        self.assertEqual(out["stats"]["set_aside"], len(out["set_aside"]))
+        chair = next(r for r in self.sent() if r["role"] == "chairman")["messages"][1]["content"]
+        self.assertIn("(no findings)", chair)
+        lens_prompt = next(r for r in self.sent() if r["role"] == "lens:security")["messages"][1]["content"]
+        self.assertIn(f'<file-deleted path="{fx.DELETED_PY_PATH}"', lens_prompt)
+        self.assertNotIn("eval(user_input)", lens_prompt)
+
+    def test_a_grounded_finding_still_blocks(self):
+        base, report = self.release_repo()
+        replies = {
+            "lens:contrarian": {"findings": [{"file": "src/App.jsx", "line": 637, "severity": "high",
+                                              "evidence": "fetch('/api/run').catch(() => {});",
+                                              "message": "A failed run is swallowed and reported as success"}]},
+            "lens": {"findings": []},
+            "chairman": {"ruling": "reject", "justification": "Errors swallowed", "blocking_finding_ids": ["F1"]},
+        }
+        p = self.run_council(replies, "--format", "json", "--base", base, "--report", report,
+                             "--lenses", "security,contrarian", "--no-cache")
+        self.assertEqual(p.returncode, 1, p.stderr)
+        out = json.loads(p.stdout)
+        self.assertEqual(out["ruling"], "reject")
+        self.assertEqual([(f["file"], f["blocking"]) for f in out["findings"]], [("src/App.jsx", True)])
+
+    def test_a_reject_naming_no_grounded_finding_fails_closed(self):
+        base, report = self.release_repo()
+        replies = {
+            "lens:contrarian": {"findings": [{"file": "src/App.jsx", "line": 637, "severity": "low",
+                                              "evidence": "fetch('/api/run').catch(() => {});",
+                                              "message": "A failed run is swallowed"}]},
+            "lens": {"findings": []},
+            "chairman": {"ruling": "reject", "justification": "F9 is bad", "blocking_finding_ids": ["F9"]},
+        }
+        p = self.run_council(replies, "--format", "json", "--base", base, "--report", report,
+                             "--lenses", "security,contrarian", "--no-cache")
+        self.assertEqual(p.returncode, 2, p.stderr)
+        out = json.loads(p.stdout)
+        self.assertIsNone(out["ruling"])
+        self.assertIn("without naming any grounded finding", out["error"])
 
 
 if __name__ == "__main__":
